@@ -27,6 +27,8 @@ export class BotController {
     this.heavyHoldUntil = 0;
     this.lightReleaseAt = 0;
     this.platformGoal = null;
+    /** performance.now() deadline while intentionally dropping to a lower foe */
+    this._dropUntil = 0;
   }
 
   getStagePlatforms() {
@@ -193,17 +195,21 @@ export class BotController {
   applyTerrainSafety(input, preferredDir) {
     const pos = this.player.position;
     const grounded = this.player.isGrounded;
+    const dropping = performance.now() < this._dropUntil;
 
     // Off-stage / falling through hole — full recover
+    // (still recover if we fell too far even during a chase drop)
     const underStage = pos.y < FALLING_Y;
     const noFooting = !grounded && !this.hasFooting(pos.x, pos.y + 1.5) && pos.y < RECOVER_Y;
-    if (underStage || noFooting) {
+    if (underStage || (noFooting && !dropping)) {
+      this._dropUntil = 0;
       return this.recoverInput();
     }
 
     if (!grounded) {
       // Airborne over a hole: drift to nearest bank / platform
-      if (!this.hasFooting(pos.x, pos.y + 2)) {
+      // (skip if we just stepped off to drop onto a lower opponent)
+      if (!dropping && !this.hasFooting(pos.x, pos.y + 2)) {
         const goal = this.nearestRecoverySurface(pos.x, pos.y);
         if (goal) {
           const dx = goal.aimX - pos.x;
@@ -214,6 +220,11 @@ export class BotController {
           }
         }
       }
+      return input;
+    }
+
+    // Intentional drop onto lower opponent — allow walking off this platform
+    if (dropping) {
       return input;
     }
 
@@ -298,6 +309,64 @@ export class BotController {
     } else if (!this.player.isGrounded && this.player.canDoubleJump && myY < climb.top - 0.3) {
       if (Math.abs(dx) < 2.5) input.jump = true;
     }
+    return input;
+  }
+
+  /**
+   * Leave a higher platform to chase someone below.
+   * Terrain safety normally blocks walking off edges — allow a controlled drop
+   * when the opponent is clearly lower and landing exists underneath.
+   */
+  applyPlatformDrop(input, target) {
+    if (!target || this.player.isDead || !this.player.isGrounded) return input;
+
+    const myX = this.player.position.x;
+    const myY = this.player.position.y;
+    const tx = target.position.x;
+    const ty = target.position.y;
+
+    // Only when opponent is meaningfully below
+    if (ty >= myY - 0.85) return input;
+
+    const mySurface = this.surfaceAt(myX, myY + 0.8);
+    if (!mySurface) return input;
+
+    // Already on the same height band as target footing — no drop needed
+    const underTarget = this.surfaceAt(tx, ty + 0.8);
+    if (underTarget && Math.abs(underTarget.top - mySurface.top) < 0.4) return input;
+
+    // Prefer dropping from soft platforms; solid main stage only if target is far below
+    if (!mySurface.oneWay && myY - ty < 1.6) return input;
+
+    // Safe landing somewhere below (stage or lower soft platform)
+    const landing = this.surfaceAt(myX, mySurface.top - 0.5);
+    const landingNearTarget = this.surfaceAt(tx, ty + 1.2);
+    const hasLanding =
+      (landing && landing.top < mySurface.top - 0.4) ||
+      (landingNearTarget && landingNearTarget.top < mySurface.top - 0.4);
+    if (!hasLanding) return input;
+
+    // Walk toward the side that gets us closer to the target, off this platform
+    const toTarget = tx - myX;
+    let dropDir = toTarget > 0.15 ? 1 : toTarget < -0.15 ? -1 : 0;
+
+    // If target is roughly under us, pick nearer edge
+    if (dropDir === 0) {
+      const distLeft = myX - mySurface.left;
+      const distRight = mySurface.right - myX;
+      dropDir = distLeft <= distRight ? -1 : 1;
+    }
+
+    // Aim past the edge so we actually leave the platform
+    const edgeX = dropDir > 0 ? mySurface.right + 0.35 : mySurface.left - 0.35;
+    const dx = edgeX - myX;
+    input.right = dx > 0.05;
+    input.left = dx < -0.05;
+    input.jump = false;
+    input.shield = false;
+
+    // Hold long enough to clear the edge and fall a short distance
+    this._dropUntil = performance.now() + 550;
     return input;
   }
 
@@ -631,6 +700,8 @@ export class BotController {
 
     // Climb soft platforms when opponent is higher
     this.applyPlatformClimb(input, target);
+    // Walk off soft platforms when opponent is below (climb may no-op)
+    this.applyPlatformDrop(input, target);
 
     // Gap / hole / edge safety last so it can override chase
     const safe = this.applyTerrainSafety(input, horizontal);
